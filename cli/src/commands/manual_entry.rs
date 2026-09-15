@@ -2,7 +2,7 @@ use clap::{arg, Parser};
 use inquire::Confirm;
 use regex::Regex;
 use std::{result::Result as StdResult, thread};
-use time::{Date, Duration, OffsetDateTime, PrimitiveDateTime, Time};
+use time::{macros::format_description, Date, Duration, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::{persistence, spinner_wrap};
 
@@ -21,8 +21,11 @@ pub struct TimeRange {
 #[derive(Debug, Parser)]
 pub struct Command {
     /// Defaults to 0 (today)
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "date")]
     pub days_ago: Option<u8>,
+    /// Date of the entry in ISO format, for example 2026-09-24 (defaults to today)
+    #[arg(short = 'D', long, value_parser = parse_input_date)]
+    pub date: Option<Date>,
     /// Before submitting check for overlap with holidays, weekends or PTO
     #[arg(short, long)]
     pub check: bool,
@@ -35,9 +38,12 @@ pub struct Command {
 
 /// Entrypoint for this module
 pub fn execute(cmd: &Command) -> Result<()> {
-    let date = super::today()
-        .checked_sub(Duration::days(i64::from(cmd.days_ago.unwrap_or(0))))
-        .unwrap();
+    let date = match cmd.date {
+        Some(date) => date,
+        None => super::today()
+            .checked_sub(Duration::days(i64::from(cmd.days_ago.unwrap_or(0))))
+            .unwrap(),
+    };
     let entry = draft_entry(date, &cmd.ranges, cmd.check)?;
     if cmd.yes || Confirm::new(&format!("Create entry {entry}?")).prompt().unwrap() {
         submit_entry(entry)?;
@@ -136,6 +142,11 @@ fn minimum_break_for(duration: Duration) -> Duration {
     dur
 }
 
+pub fn parse_input_date(s: &str) -> StdResult<Date, String> {
+    Date::parse(s, format_description!("[year]-[month]-[day]"))
+        .map_err(|_| "Date must be in ISO format, for example 2026-09-24".into())
+}
+
 pub fn parse_input_shifts(s: &str) -> StdResult<TimeRange, String> {
     let re = Regex::new(r"^(?P<h1>\d{1,2})(?::(?P<m1>\d{2}))?-(?P<h2>\d{1,2})(?::(?P<m2>\d{2}))?$").unwrap();
     if let Some(m) = re.captures(s) {
@@ -152,7 +163,17 @@ pub fn parse_input_shifts(s: &str) -> StdResult<TimeRange, String> {
 
 #[cfg(test)]
 mod tests {
-    use time::Duration;
+    use time::{Duration, Month};
+
+    #[test]
+    fn parse_input_date() {
+        let date = super::parse_input_date("2026-09-24").unwrap();
+        assert_eq!(date.year(), 2026);
+        assert_eq!(date.month(), Month::September);
+        assert_eq!(date.day(), 24);
+        assert!(super::parse_input_date("24.09.2026").is_err());
+        assert!(super::parse_input_date("2026-13-01").is_err());
+    }
 
     #[test]
     fn minimum_break_for() {
