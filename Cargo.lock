@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "rippling-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "json_value_merge",
  "regex",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "rippling-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "confy",
