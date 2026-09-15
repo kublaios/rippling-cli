@@ -1,18 +1,14 @@
 pub mod live;
 pub mod manual_entry;
-pub mod mfa;
 pub mod pto;
 
-use std::io;
-
 use clap::Subcommand;
-use spinners::{Spinner, Spinners};
+use core::time::Duration;
+use indicatif::ProgressBar;
+use rippling_api::{self, Client};
 use time::{macros::format_description, Date, OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
-use crate::{
-    client::{self, time_entries::TimeEntryBreak, Session},
-    persistence::Settings,
-};
+use crate::persistence::State;
 
 use self::pto::CheckOutcome;
 
@@ -26,11 +22,12 @@ pub enum Commands {
         command: ConfigureCommands,
     },
 
-    /// Authenticate against rippling
-    Authenticate,
-
     /// Clock-in Status
-    Status,
+    Status {
+        /// Compact format
+        #[arg(short, long, default_value_t = false)]
+        compact: bool,
+    },
 
     /// Clock In
     #[clap(alias = "in")]
@@ -50,22 +47,19 @@ pub enum Commands {
 
     /// Manually add entry for a day
     Manual(manual_entry::Command),
-
-    /// Multi Factor Authentication flows
-    Mfa(mfa::Command),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigureCommands {
-    Username { value: String },
+    AccessToken { value: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
-    ApiError(client::Error),
-    AlreadyOnBreak(TimeEntryBreak),
+    ApiError(rippling_api::Error),
+    AlreadyOnBreak,
     NotClockedIn,
     NotOnBreak,
     NoManualBreakType,
@@ -77,7 +71,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ApiError(e) => write!(f, "{e}"),
-            Self::AlreadyOnBreak(_) => write!(f, "Already on a break"),
+            Self::AlreadyOnBreak => write!(f, "Already on a break"),
             Self::NotClockedIn => write!(f, "Not clocked in"),
             Self::NotOnBreak => write!(f, "Not on a break"),
             Self::NoManualBreakType => write!(f, "No manual break type"),
@@ -85,76 +79,65 @@ impl std::fmt::Display for Error {
             Self::NoWorkingDay(r) => match r {
                 CheckOutcome::Leave => write!(f, "You are on PTO"),
                 CheckOutcome::Holiday(h) => write!(f, "It is a holiday ({})", h.name),
-                CheckOutcome::Weekend(d) => write!(f, "It is a weekend ({})", d),
+                CheckOutcome::Weekend(d) => write!(f, "It is a weekend ({d})"),
                 _ => panic!("Unhandled enum match"),
             },
         }
     }
 }
 
-impl From<client::Error> for Error {
-    fn from(value: client::Error) -> Self {
+impl From<rippling_api::Error> for Error {
+    fn from(value: rippling_api::Error) -> Self {
         Error::ApiError(value)
     }
 }
 
-pub fn execute(command: &Commands) {
-    let mut cfg = Settings::load();
-
+pub fn execute(command: &Commands) -> Result<()> {
     match command {
-        Commands::Authenticate => authenticate(&cfg),
-        Commands::ClockIn => live::clock_in_spinner(),
-        Commands::ClockOut => live::clock_out_spinner(),
-        Commands::Status => live::status_spinner(),
-        Commands::StartBreak => live::start_break_spinner(),
-        Commands::EndBreak => live::end_break_spinner(),
-        Commands::Configure { command } => {
-            match command {
-                ConfigureCommands::Username { value } => cfg.username = Some(value.clone()),
+        Commands::ClockIn => live::clock_in(),
+        Commands::ClockOut => live::clock_out(),
+        Commands::Status { compact } => {
+            if *compact {
+                live::status_compact()
+            } else {
+                live::status()
             }
-
-            cfg.store();
         }
+        Commands::StartBreak => live::start_break(),
+        Commands::EndBreak => live::end_break(),
+        Commands::Configure { command } => match command {
+            ConfigureCommands::AccessToken { value } => set_access_token(value),
+        },
         Commands::Manual(cmd) => manual_entry::execute(cmd),
-        Commands::Mfa(command) => mfa::execute(command),
-    };
-}
-
-fn authenticate(cfg: &Settings) {
-    let username = match &cfg.username {
-        None => ask_user_input("Enter your user name"),
-        Some(value) => value.clone(),
-    };
-    let password = ask_user_input("Enter your password");
-
-    let client = client::PublicClient::initialize_from_remote().unwrap();
-    match client.authenticate(&username, &password) {
-        Ok(mut session) => {
-            let info = client::account_info::fetch(&session).expect("Failed to query account info");
-            session.set_company_and_role(info.role.company.id, info.id);
-            session.save();
-        }
-        _ => println!("Authentication failed"),
     }
 }
 
-fn ask_user_input(prompt: &str) -> String {
-    println!("> {prompt}");
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read input");
-    input.trim().to_owned()
+#[macro_export]
+macro_rules! spinner_wrap {
+    ( $res: expr ) => {{
+        if $crate::is_interactive() {
+            {
+                let spinner = $crate::commands::start_spinner();
+                let result = $res;
+                spinner.finish_and_clear();
+                result
+            }
+        } else {
+            $res
+        }
+    }};
 }
 
-fn get_session() -> Session {
-    #[cfg(not(test))]
-    let session = Session::load();
-    #[cfg(test)]
-    let session = {
-        let mut session = Session::new("access-token".into());
-        session.set_company_and_role("company-id".into(), "my-role-id".into());
-        session
+fn set_access_token(token: &str) -> Result<()> {
+    let client: Client = Client::new(token.to_string());
+    let info = spinner_wrap!(client.account_info())?;
+    let state = State {
+        company_id: Some(info.role.company.id),
+        role_id: Some(info.id),
+        token: Some(token.to_string()),
     };
-    session
+    state.store();
+    Ok(())
 }
 
 fn today() -> Date {
@@ -163,32 +146,17 @@ fn today() -> Date {
     OffsetDateTime::now_utc().to_offset(local_offset()).date()
 }
 
-fn wrap_in_spinner<T, E, Fn, Ok>(f: Fn, ok: Ok)
-where
-    Fn: FnOnce() -> std::result::Result<T, E>,
-    Ok: FnOnce(T) -> String,
-    E: std::fmt::Display,
-{
-    wrap_in_spinner_or(f, ok, |e| format!("Error: {e}"))
-}
-
-fn wrap_in_spinner_or<T, E, Fn, Ok, Er>(f: Fn, ok: Ok, er: Er)
-where
-    Fn: FnOnce() -> std::result::Result<T, E>,
-    Ok: FnOnce(T) -> String,
-    Er: FnOnce(E) -> String,
-{
-    let mut sp = Spinner::new(Spinners::Dots9, String::from("Connecting with rippling"));
-    match f() {
-        Ok(t) => sp.stop_with_message(ok(t)),
-        Err(e) => sp.stop_with_message(er(e)),
-    }
+pub(crate) fn start_spinner() -> ProgressBar {
+    let s = ProgressBar::new_spinner();
+    s.set_message("Connecting with rippling...");
+    s.enable_steady_tick(Duration::new(0, 100_000_000));
+    s
 }
 
 fn format_hours(hours: f32) -> String {
     let h = hours.floor();
     let m = (hours.fract() * 60.0).floor();
-    format!("{:1}:{:02}", h, m)
+    format!("{h:1}:{m:02}")
 }
 
 fn local_time_format(datetime: OffsetDateTime) -> String {

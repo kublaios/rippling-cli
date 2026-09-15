@@ -2,17 +2,26 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use super::session::Session;
 use super::{Error, Result};
 
-pub fn active_policy(session: &Session) -> Result<ActivePolicy> {
-    let mut map: HashMap<String, ActivePolicy> =
-        session.get_json("time_tracking/api/time_entry_policies/get_active_policy")?;
-    map.remove(session.role().unwrap()).ok_or(Error::UnexpectedPayload)
-}
+impl super::Client {
+    pub fn active_break_policy(&self) -> Result<ActivePolicy> {
+        let mut map: HashMap<String, ActivePolicy> = self
+            .get("time_tracking/api/time_entry_policies/get_active_policy")
+            .call()?
+            .body_mut()
+            .read_json()?;
+        map.remove(self.role().unwrap()).ok_or(Error::UnexpectedPayload)
+    }
 
-pub fn fetch(session: &Session, id: &str) -> Result<BreakPolicy> {
-    session.get_json(&format!("time_tracking/api/time_entry_break_policies/{id}"))
+    pub fn break_policy(&self, id: &str) -> Result<BreakPolicy> {
+        let break_policy: BreakPolicy = self
+            .get(&format!("time_tracking/api/time_entry_break_policies/{id}"))
+            .call()?
+            .body_mut()
+            .read_json()?;
+        Ok(break_policy)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,19 +98,22 @@ impl BreakPolicy {
 mod tests {
     use utilities::mocking;
 
-    use super::*;
+    use crate::Client;
 
-    fn session() -> Session {
-        let mut session = Session::new("access-token".into());
-        session.set_company_and_role("some-company-id".into(), "my-role-id".into());
-        session
+    fn setup() -> (mocking::FakeRippling, Client) {
+        let server = mocking::FakeRippling::new();
+        let client = Client::new("access-token".to_owned())
+            .with_root(url::Url::parse(&server.url()).unwrap())
+            .with_company_and_role("some-company-id".to_owned(), "some-role-id".to_owned());
+        (server, client)
     }
 
     #[test]
     fn it_can_fetch_a_break_policy() {
-        let _m = mocking::mock_break_policy("policy-id");
+        let (mut server, client) = setup();
+        let _m = server.mock_break_policy("policy-id");
 
-        let policy = fetch(&session(), "policy-id").unwrap();
+        let policy = client.break_policy("policy-id").unwrap();
         let mybreak = policy.manual_break_type().unwrap();
         assert_eq!(mybreak.id, "break-id-1");
         assert_eq!(mybreak.description, "Lunch Break - Manually clock in/out");
@@ -109,9 +121,10 @@ mod tests {
 
     #[test]
     fn it_can_fetch_active_policy() {
-        let _m = mocking::mock_active_policy();
+        let (mut server, client) = setup();
+        let _m = server.mock_active_policy();
 
-        let policy = active_policy(&session()).unwrap();
+        let policy = client.active_break_policy().unwrap();
         assert_eq!(policy.break_policy, "some-break-policy-id");
         assert_eq!(policy.time_policy, "some-policy-id");
         assert_eq!(policy.role_overrides.role_properties.default_timezone, "Europe/Berlin");

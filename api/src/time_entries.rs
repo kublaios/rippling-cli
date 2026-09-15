@@ -1,57 +1,72 @@
 use json_value_merge::Merge;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use time::format_description::FormatItem;
+use time::macros::format_description;
+use time::serde::rfc3339;
 use time::{Duration, OffsetDateTime};
 
-use time::serde::rfc3339;
-
-use super::session::Session;
 use super::Result;
 
-pub fn create_entry(session: &Session, entry: &NewTimeEntry) -> Result<TimeEntry> {
-    let mut body = json!(&entry);
-    body.merge(json!({"company":session.company(), "role":session.role()}));
-    session
-        .post("time_tracking/api/time_entries")
-        .send_json(&body)?
-        .parse_json()
-}
+impl super::Client {
+    pub fn create_time_entry(&self, entry: &NewTimeEntry) -> Result<TimeEntry> {
+        let mut body = json!(&entry);
+        body.merge(&json!({"company":self.company(), "role":self.role()}));
+        let entry: TimeEntry = self
+            .post("time_tracking/api/time_entries")
+            .send_json(&body)?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entry)
+    }
 
-pub fn current_entry(session: &Session) -> Result<Option<TimeEntry>> {
-    let entries: Vec<TimeEntry> = session
-        .get("time_tracking/api/time_entries")
-        .param("endTime", "") // Filter for entries with no end time
-        .send()?
-        .parse_json()?;
-    Result::Ok(entries.into_iter().next())
-}
+    pub fn current_time_entry(&self) -> Result<Option<TimeEntry>> {
+        // Role must be present as URL parameter, otherwise Managers might see employees records as status
+        let query: Vec<(&str, &str)> = vec![("endTime", ""), ("role", self.role().expect("Missing Role"))];
+        let entries: Vec<TimeEntry> = self
+            .get("time_tracking/api/time_entries")
+            .query_pairs(query)
+            .call()?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entries.into_iter().next())
+    }
 
-pub fn start_break(session: &Session, id: &str, break_type_id: &str) -> Result<TimeEntry> {
-    session
-        .post(&format!("time_tracking/api/time_entries/{id}/start_break"))
-        .send_json(&json!({"source": "WEB_CLOCK", "break_type": break_type_id}))?
-        .parse_json()
-}
+    pub fn start_break(&self, id: &str, break_type_id: &str) -> Result<TimeEntry> {
+        let entry: TimeEntry = self
+            .post(&format!("time_tracking/api/time_entries/{id}/start_break"))
+            .send_json(json!({"source": "WEB_CLOCK", "break_type": break_type_id}))?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entry)
+    }
 
-pub fn end_break(session: &Session, id: &str, break_type_id: &str) -> Result<TimeEntry> {
-    session
-        .post(&format!("time_tracking/api/time_entries/{id}/end_break"))
-        .send_json(&json!({"source": "WEB_CLOCK", "break_type": break_type_id}))?
-        .parse_json()
-}
+    pub fn end_break(&self, id: &str, break_type_id: &str) -> Result<TimeEntry> {
+        let entry: TimeEntry = self
+            .post(&format!("time_tracking/api/time_entries/{id}/end_break"))
+            .send_json(json!({"source": "WEB_CLOCK", "break_type": break_type_id}))?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entry)
+    }
 
-pub fn start_clock(session: &Session) -> Result<TimeEntry> {
-    session
-        .post("time_tracking/api/time_entries/start_clock")
-        .send_json(&json!({"source": "WEB_CLOCK", "role": session.role().unwrap()}))?
-        .parse_json()
-}
+    pub fn start_clock(&self) -> Result<TimeEntry> {
+        let entry: TimeEntry = self
+            .post("time_tracking/api/time_entries/start_clock")
+            .send_json(json!({"source": "WEB_CLOCK", "role": self.role().unwrap()}))?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entry)
+    }
 
-pub fn end_clock(session: &Session, id: &str) -> Result<TimeEntry> {
-    session
-        .post(&format!("time_tracking/api/time_entries/{id}/stop_clock"))
-        .send_json(&json!({"source": "WEB_CLOCK"}))?
-        .parse_json()
+    pub fn end_clock(&self, id: &str) -> Result<TimeEntry> {
+        let entry: TimeEntry = self
+            .post(&format!("time_tracking/api/time_entries/{id}/stop_clock"))
+            .send_json(json!({"source": "WEB_CLOCK"}))?
+            .body_mut()
+            .read_json()?;
+        Result::Ok(entry)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,6 +75,42 @@ pub struct NewTimeEntry {
     pub shifts: Vec<NewTimeEntryShift>,
     pub breaks: Vec<NewTimeEntryBreak>,
     source: String,
+}
+
+const DATE_FMT: &[FormatItem] = format_description!("[weekday repr:short] [day] [month repr:short]");
+const TIME_FMT: &[FormatItem] = format_description!("[hour]:[minute]");
+
+impl NewTimeEntry {
+    fn render_breaks(&self) -> String {
+        self.breaks.iter().fold(String::new(), |mut a, b| {
+            if !a.is_empty() {
+                a.push_str(", ");
+            }
+            a.push_str(&format!(
+                "{}-{}",
+                b.start_time.format(TIME_FMT).unwrap(),
+                b.end_time.format(TIME_FMT).unwrap()
+            ));
+            a
+        })
+    }
+}
+
+impl std::fmt::Display for NewTimeEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let shift = self.shifts.first().unwrap();
+        let date = shift.start_time.date();
+        let mut out = format!(
+            "{} {}-{}",
+            date.format(DATE_FMT).unwrap(),
+            shift.start_time.format(TIME_FMT).unwrap(),
+            shift.end_time.format(TIME_FMT).unwrap()
+        );
+        if !self.breaks.is_empty() {
+            out.push_str(&format!(" (Breaks {})", self.render_breaks()));
+        }
+        write!(f, "{out}")
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -122,13 +173,12 @@ impl NewTimeEntry {
     }
 
     pub fn add_shift(&mut self, start_time: OffsetDateTime, end_time: OffsetDateTime) {
-        self.shifts
-            .push(NewTimeEntryShift { start_time: start_time, end_time: end_time });
+        self.shifts.push(NewTimeEntryShift { start_time, end_time });
     }
 
     pub fn add_break(&mut self, break_type: String, start_time: OffsetDateTime, end_time: OffsetDateTime) {
         self.breaks
-            .push(NewTimeEntryBreak { break_type_id: break_type, start_time: start_time, end_time: end_time });
+            .push(NewTimeEntryBreak { break_type_id: break_type, start_time, end_time });
     }
 }
 
@@ -140,10 +190,7 @@ impl TimeEntry {
 
 impl TimeEntryBreak {
     pub fn duration(&self) -> Option<Duration> {
-        match self.end_time {
-            Some(end) => Some(end - self.start_time),
-            None => None,
-        }
+        self.end_time.map(|end| end - self.start_time)
     }
 }
 
@@ -157,18 +204,23 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::Client;
+
     use super::*;
     use time::{format_description::well_known::Rfc3339, macros::datetime, UtcOffset};
     use utilities::mocking;
 
-    fn session() -> Session {
-        let mut session = Session::new("access-token".into());
-        session.set_company_and_role("some-company-id".into(), "some-role-id".into());
-        session
+    fn setup() -> (mocking::FakeRippling, Client) {
+        let server = mocking::FakeRippling::new();
+        let client = Client::new("access-token".to_owned())
+            .with_root(url::Url::parse(&server.url()).unwrap())
+            .with_company_and_role("some-company-id".to_owned(), "some-role-id".to_owned());
+        (server, client)
     }
 
     #[test]
     fn it_can_create_entries() {
+        let (mut server, client) = setup();
         let mut new_entry = NewTimeEntry::new();
         new_entry.add_shift(datetime!(2023-01-20 08:00 +1), datetime!(2023-01-20 17:00 +1));
         new_entry.add_break(
@@ -177,7 +229,8 @@ mod tests {
             datetime!(2023-01-20 12:45 +1),
         );
 
-        let m = mocking::with_fixture("POST", "/time_tracking/api/time_entries", "time_entry")
+        let m = server
+            .with_fixture("POST", "/time_tracking/api/time_entries", "time_entry")
             .with_status(201)
             .match_body(mocking::Matcher::Json(json!(
                 {
@@ -201,16 +254,23 @@ mod tests {
             )))
             .create();
 
-        let entry = create_entry(&session(), &new_entry);
+        let entry = client.create_time_entry(&new_entry);
         assert!(entry.is_ok());
         m.assert();
     }
 
     #[test]
     fn it_can_fetch_current_entry() {
-        let _m = mocking::with_fixture("GET", "/time_tracking/api/time_entries?endTime=", "time_entries").create();
+        let (mut server, client) = setup();
+        let _m = server
+            .with_fixture(
+                "GET",
+                "/time_tracking/api/time_entries?endTime=&role=some-role-id",
+                "time_entries",
+            )
+            .create();
 
-        let entry = current_entry(&session()).unwrap().unwrap();
+        let entry = client.current_time_entry().unwrap().unwrap();
         assert_eq!(entry.active_policy.break_policy_id, "some-break-policy");
         assert_eq!(
             entry.start_time.to_offset(UtcOffset::UTC).format(&Rfc3339).unwrap(),
@@ -222,7 +282,9 @@ mod tests {
 
     #[test]
     fn it_can_start_the_clock() {
-        let _m = mocking::with_fixture("POST", "/time_tracking/api/time_entries/start_clock", "time_entry")
+        let (mut server, client) = setup();
+        let _m = server
+            .with_fixture("POST", "/time_tracking/api/time_entries/start_clock", "time_entry")
             .match_body(mocking::Matcher::Json(
                 json!({"source": "WEB_CLOCK", "role": "some-role-id"}),
             ))
@@ -230,7 +292,7 @@ mod tests {
             .match_header("role", "some-role-id")
             .create();
 
-        let entry = start_clock(&session()).unwrap();
+        let entry = client.start_clock().unwrap();
         assert_eq!(
             entry.start_time.to_offset(UtcOffset::UTC).format(&Rfc3339).unwrap(),
             "2023-01-19T08:22:25Z"
@@ -239,13 +301,15 @@ mod tests {
 
     #[test]
     fn it_can_stop_the_clock() {
-        let _m = mocking::with_fixture("POST", "/time_tracking/api/time_entries/id/stop_clock", "time_entry")
+        let (mut server, client) = setup();
+        let _m = server
+            .with_fixture("POST", "/time_tracking/api/time_entries/id/stop_clock", "time_entry")
             .match_body(mocking::Matcher::Json(json!({"source": "WEB_CLOCK"})))
             .match_header("company", "some-company-id")
             .match_header("role", "some-role-id")
             .create();
 
-        let entry = end_clock(&session(), &"id").unwrap();
+        let entry = client.end_clock("id").unwrap();
         assert_eq!(
             entry.start_time.to_offset(UtcOffset::UTC).format(&Rfc3339).unwrap(),
             "2023-01-19T08:22:25Z"
@@ -254,7 +318,9 @@ mod tests {
 
     #[test]
     fn it_can_take_a_break() {
-        let m = mocking::with_fixture("POST", "/time_tracking/api/time_entries/id/start_break", "time_entry")
+        let (mut server, client) = setup();
+        let m = server
+            .with_fixture("POST", "/time_tracking/api/time_entries/id/start_break", "time_entry")
             .match_body(mocking::Matcher::Json(
                 json!({"source": "WEB_CLOCK", "break_type": "break-type-id"}),
             ))
@@ -262,13 +328,15 @@ mod tests {
             .match_header("role", "some-role-id")
             .create();
 
-        start_break(&session(), &"id", &"break-type-id").unwrap();
-        m.assert()
+        client.start_break("id", "break-type-id").unwrap();
+        m.assert();
     }
 
     #[test]
     fn it_can_stop_a_break() {
-        let m = mocking::with_fixture("POST", "/time_tracking/api/time_entries/id/end_break", "time_entry")
+        let (mut server, client) = setup();
+        let m = server
+            .with_fixture("POST", "/time_tracking/api/time_entries/id/end_break", "time_entry")
             .match_body(mocking::Matcher::Json(
                 json!({"source": "WEB_CLOCK", "break_type": "break-type-id"}),
             ))
@@ -276,7 +344,7 @@ mod tests {
             .match_header("role", "some-role-id")
             .create();
 
-        end_break(&session(), &"id", &"break-type-id").unwrap();
-        m.assert()
+        client.end_break("id", "break-type-id").unwrap();
+        m.assert();
     }
 }
