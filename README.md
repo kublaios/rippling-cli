@@ -60,11 +60,14 @@ Arguments:
 
 Options:
   -d, --days-ago <DAYS_AGO>  Defaults to 0 (today)
+  -D, --date <DATE>          Date of the entry in ISO format, for example 2026-09-24 (defaults to today)
   -c, --check                Before submitting check for overlap with holidays, weekends or PTO
   -y, --yes                  Bypass prompt with a yes answer
   -h, --help                 Print help
 ```
 
 Example: `rippling-cli manual 8:30-17`
+
+Example for a specific date: `rippling-cli manual --date 2026-09-24 9-17:30`
 
 Will add an entry from **8:30** to **17:00** with the German statutory breaks in the middle, in this case a 30min break from **12:30** to **13:00**. The statutory break is 30min when working over 6hrs, and 45min when working over 9hrs. The minimum valid break is 15min, so when adding an entry like `8-14:05` it will use a 15min break and not 5min.`
